@@ -1,37 +1,43 @@
 import akka.NotUsed
-import akka.actor.typed.{ActorSystem, Behavior, Props}
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.actor.typed.{ActorSystem, Behavior, Props}
 import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal
 import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
-import akka.stream.scaladsl.{Flow, GraphDSL, Sink, Source}
-import scalikejdbc.{ConnectionPool, ConnectionPoolSettings, DB}
-import akka_typed.CalculatorRepository.{getlatestOffsetAndResult, initdatabase, updateresultAndOffset}
-import scalikejdbc.ConnectionPool.borrow
-import scalikejdbc.DB.using
-import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiply, Multiplied}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, RunnableGraph, Sink, Source}
+import akka.stream.{ClosedShape, Graph, SinkShape}
+import akka_typed.CalculatorRepository.{createSession, updateresultAndOffset}
+import akka_typed.TypedCalculatorWriteSide._
+import scalikejdbc.{ConnectionPool, ConnectionPoolSettings}
+import slick.jdbc.GetResult
+
+import scala.concurrent.duration.DurationInt
+import scala.concurrent.{Await, ExecutionContextExecutor, Future}
+import scala.language.postfixOps
 
 object akka_typed {
   trait CborSerialization
   val persId = PersistenceId.ofUniqueId("001")
 
+  implicit val session: SlickSession = createSession()
+
   object TypedCalculatorWriteSide {
     sealed trait Command
-    case class Add(amount: Int) extends Command
-    case class Multiply(amount: Int) extends Command
-    case class Divide(amount: Int) extends Command
+    case class Add(amount: Double) extends Command
+    case class Multiply(amount: Double) extends Command
+    case class Divide(amount: Double) extends Command
 
     sealed trait Event
-    case class Added(id: Int, amount: Int) extends Event
-    case class Multiplied(id: Int, amount: Int) extends Event
-    case class Divided(id: Int, amount: Int) extends Event
+    case class Added(id: Int, amount: Double) extends Event
+    case class Multiplied(id: Int, amount: Double) extends Event
+    case class Divided(id: Int, amount: Double) extends Event
 
-    final case class State(value: Int) extends CborSerialization{
-      def add(amount: Int): State = copy(value = value + amount)
-      def multiply(amount: Int): State = copy(value = value * amount)
-      def divide(amount: Int): State = copy(value = value / amount)
+    final case class State(value: Double) extends CborSerialization{
+      def add(amount: Double): State = copy(value = value + amount)
+      def multiply(amount: Double): State = copy(value = value * amount)
+      def divide(amount: Double): State = copy(value = value / amount)
     }
 
     object State{
@@ -39,19 +45,19 @@ object akka_typed {
     }
 
     def handleCommand(
-                     persId: String,
-                     state: State,
-                     command: Command,
-                     ctx: ActorContext[Command]
+                       persId: String,
+                       state: State,
+                       command: Command,
+                       ctx: ActorContext[Command]
                      ): Effect[Event, State] =
       command match {
         case Add(amount) =>
           ctx.log.info(s"receive adding for number: $amount and state is ${state.value} ")
           val added = Added(persId.toInt, amount)
           Effect.persist(added)
-          .thenRun{
-            x=> ctx.log.info(s"The state result is ${x.value}")
-          }
+            .thenRun{
+              x=> ctx.log.info(s"The state result is ${x.value}")
+            }
         case Multiply(amount) =>
           ctx.log.info(s"receive multiply for number: $amount and state is ${state.value} ")
           val multiplied = Multiplied(persId.toInt, amount)
@@ -95,10 +101,19 @@ object akka_typed {
 
 
   case class TypedCalculatorReadSide(system: ActorSystem[NotUsed]){
-    initdatabase
+    import CalculatorRepository.Result
     implicit val materializer = system.classicSystem
-    var (offset, latestCalculatedResult) = getlatestOffsetAndResult
-    val startOffset: Int = if (offset == 1) 1 else offset + 1
+
+    val res: Result = CalculatorRepository.getlatestOffsetAndResult match {
+      case Right(value) => value
+      case Left(_) =>
+        println("Error while getting latest offset and result, use default value")
+        Result(0, 1)
+    }
+    var latestCalculatedResult = res.state
+    var offset = res.offset
+
+    val startOffset: Long = if (offset == 1) 1 else offset + 1
     val readJournal = PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
 
     /*
@@ -144,72 +159,75 @@ object akka_typed {
 
     val source: Source[EventEnvelope, NotUsed] = readJournal.eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
-    source
-      .map { x =>
-        println(x.toString())
-        x
-      }
-      .runForeach{
-        event =>
-          event.event match {
-            case Added(_, amount) =>
-              latestCalculatedResult += amount
-              updateresultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Added: $latestCalculatedResult")
-            case Multiplied(_, amount) =>
-              latestCalculatedResult *= amount
-              updateresultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Multiplied: $latestCalculatedResult")
-            case Divided(_, amount) =>
-              latestCalculatedResult /= amount
-              updateresultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Divided: $latestCalculatedResult")
-          }
-      }
+    val program: Graph[ClosedShape, NotUsed] = GraphDSL.create() { builder =>
 
+      val input = builder.add(source)
+      val stateUpdate = builder.add(Flow[EventEnvelope].map(e => updateState(e)))
+      val localSaveOutput: SinkShape[Result] = builder.add(Sink.foreach[Result](r => {
+        println(r)
+        latestCalculatedResult + r.state
+      }))
+      val dbSaveOutput: SinkShape[Result] = builder.add(Sink.foreach[Result](r => updateresultAndOffset(r.state, r.offset)))
+
+      val broadcasting = builder.add(Broadcast[Result](2))
+      input -> stateUpdate -> broadcasting
+
+      broadcasting.out(0) -> localSaveOutput
+      broadcasting.out(1) -> dbSaveOutput
+
+      ClosedShape
+    }
+
+    def updateState(eventEnvelope: EventEnvelope): CalculatorRepository.Result = {
+      Result (
+        eventEnvelope.event match {
+          case Added(_, amount) =>
+            latestCalculatedResult + amount
+          case Multiplied(_, amount) =>
+            latestCalculatedResult * amount
+          case Divided(_, amount) =>
+            latestCalculatedResult / amount
+        },
+        eventEnvelope.sequenceNr)
+    }
   }
 
   object CalculatorRepository {
     //homework, how to do
     //1. SlickSession здесь надо посмотреть документацию
-    //def createSession(): SlickSession
-
+    def createSession(): SlickSession = {
+      SlickSession.forConfig("slick")
+    }
 
     def initdatabase: Unit = {
       Class.forName("org.postgresql.Driver")
-      val poolSettings = ConnectionPoolSettings(initialSize = 10, maxSize = 100)
+      val poolSettings = ConnectionPoolSettings(initialSize = 10, maxSize = 100, driverName = "org.postgresql.Driver")
       ConnectionPool.singleton("jdbc:postgresql://localhost:5432/demo", "docker", "docker", poolSettings)
     }
 
     // homework
-    //case class Result(state: Double, offset: Long)
+    case class Result(state: Double, offset: Long)
     // надо переделать getlatestOffsetAndResult
     // def getlatestOffsetAndResult: Result = {
     // val query = sql"select * from public.result where id = 1;".as[Double].headOption
     // надо будет создать future для db.run
     // с помощью await надо получить результат или прокинуть ошибку если результата нет
 
-    def getlatestOffsetAndResult: (Int, Double) = {
-      val entities =
-        DB readOnly { session =>
-          session.list("select * from public.result where id = 1;") {
-            row =>
-              (
-                row.int("write_side_offset"),
-                row.double("calculated_value"))
-          }
-        }
-      entities.head
+    def getlatestOffsetAndResult (implicit session: SlickSession): Either[Exception, Result] = {
+      import session.profile.api._
+      implicit val getUserResult: GetResult[Result] = GetResult(row => Result(row.nextDouble(), row.nextLong()))
+
+      val query: Future[Option[Result]] = session.db.run(
+        sql"select calculated_value, write_side_offset from public.result where id = 1"
+        .as[Result].headOption)
+
+      Await.result( query, 5 second).toRight(new Exception("No result"))
     }
 
-    def updateresultAndOffset(calculated: Double, offset: Long): Unit = {
-      using(DB(borrow(ConnectionPool))) {
-        db =>
-          db.autoClose(true)
-          db.localTx{
-            _.update("update public.result set calculated_value = ?, write_side_offset = ? where id = 1",
-              calculated, offset)
-          }
+    def updateresultAndOffset(calculated: Double, offset: Long)(implicit session: SlickSession): Unit = {
+      import session.profile.api._
+      Slick.sink[Result] { r: Result
+        => sqlu"update public.result set calculated_value = ${calculated}, write_side_offset = ${offset} where id = 1"
       }
     }
   }
@@ -227,9 +245,10 @@ object akka_typed {
   def main(args: Array[String]): Unit = {
     val value = akka_typed()
     implicit val system: ActorSystem[NotUsed] = ActorSystem(value, "akka_typed")
-    implicit  val executionContext = system.executionContext
+    implicit  val executionContext: ExecutionContextExecutor = system.executionContext
 
-    TypedCalculatorReadSide(system)
+    val program = TypedCalculatorReadSide(system).program
+    RunnableGraph.fromGraph(program).run()
   }
 
 
